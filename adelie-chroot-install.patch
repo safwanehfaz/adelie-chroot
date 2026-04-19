@@ -1,0 +1,63 @@
+diff --git a/adelie-chroot-install b/adelie-chroot-install
+index 1111111..2222222 100755
+--- a/adelie-chroot-install
++++ b/adelie-chroot-install
+@@ -1,6 +1,7 @@
+ #!/bin/sh
+ # vim: set ts=4:
+ #---help---
++# (help text unchanged)
+ # Usage: adelie-chroot-install [options]
+ #
+ # This script installs Adélie Linux into a chroot from a prebuilt rootfs tarball,
+@@ -64,6 +65,35 @@ fetch_url() {
+ 	fi
+ }
+ 
++confirm_wipe_chroot_dir() {
++	local dir="$1"
++
++	# If dir is empty, don't prompt.
++	if [ -z "$(ls -A "$dir" 2>/dev/null || true)" ]; then
++		return 0
++	fi
++
++	cat >&2 <<-EOF
++Target directory is not empty: $dir
++
++This looks like a previous install or existing files.
++Re-installing can leave a broken mixed filesystem.
++
++Do you want to REMOVE ALL files under:
++  $dir
++and continue? Type 'yes' to continue:
++EOF
++
++	read -r answer
++	if [ "$answer" != "yes" ]; then
++		die "Aborted. Directory not emptied: $dir"
++	fi
++
++	einfo "Removing existing files under $dir"
++	[ "$dir" != "/" ] || die "Refusing to wipe /"
++	rm -rf --one-file-system "$dir"/* "$dir"/.[!.]* "$dir"/..?* 2>/dev/null || true
++}
++
+ download_file() (
+ 	local url="$1"
+ 	local sha256="$2"
+@@ -216,14 +246,10 @@ einfo 'Downloading Adélie rootfs tarball'
+ download_file "$ADELIE_ROOTFS_URI" "$ADELIE_ROOTFS_SHA256" "$TEMP_DIR"
+ ROOTFS="$TEMP_DIR/${ADELIE_ROOTFS_URI##*/}"
+ 
+ einfo "Extracting Adélie rootfs into $CHROOT_DIR"
+-# Be defensive: avoid extracting on top of random existing stuff.
+-if [ -e "$CHROOT_DIR/etc" ] || [ -e "$CHROOT_DIR/usr" ]; then
+-	die "Target $CHROOT_DIR doesn't look empty. Pick a new -d dir or remove the old one."
+-fi
++confirm_wipe_chroot_dir "$CHROOT_DIR"
+ tar -xJf "$ROOTFS" -C "$CHROOT_DIR"
+ 
+ gen_chroot_script > "$CHROOT_DIR/enter-chroot"
+ gen_destroy_script > "$CHROOT_DIR/destroy"
+ chmod +x "$CHROOT_DIR/enter-chroot" "$CHROOT_DIR/destroy"
