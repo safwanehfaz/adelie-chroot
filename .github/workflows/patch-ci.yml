@@ -1,55 +1,86 @@
-name: Apply patch [Debug]
-
+name: Add wipe prompt to adelie-chroot-install
 
 on:
   workflow_dispatch: {}
-  push:
-    paths:
-      - "*.patch"
-    branches: [ debug ]
 
 permissions:
   contents: write
-
-concurrency:
-  group: apply-patch
-  cancel-in-progress: false
 
 jobs:
   apply:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
       - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-      
-      - name: Apply patch
+
+      - name: Apply change (idempotent)
+        shell: bash
         run: |
-          ls -la
-          test -f adelie-chroot-install.patch
+          set -euo pipefail
 
-          echo "---- Patch header ----"
-          sed -n '1,120p' adelie-chroot-install.patch
+          file="adelie-chroot-install"
 
-          echo "---- Around line 63 ----"
-          nl -ba adelie-chroot-install.patch | sed -n '50,80p'
-
-          git apply --check adelie-chroot-install.patch
-          git apply --whitespace=fix adelie-chroot-install.patch
-
-      - name: Commit & push (if changes)
-        run: |
-          if git diff --quiet; then
-            echo "No changes after applying patch."
-            exit 0
+          # 1) Insert confirm_wipe_chroot_dir() after fetch_url() if not present
+          if ! grep -q '^confirm_wipe_chroot_dir()' "$file"; then
+            awk '
+              { print }
+              /^fetch_url\(\) \{/ { in_fetch=1 }
+              in_fetch && /^\}/ {  # end of fetch_url()
+                in_fetch=0
+                print ""
+                print "confirm_wipe_chroot_dir() {"
+                print "\tlocal dir=\"$1\""
+                print ""
+                print "\t# If dir is empty, don'\''t prompt."
+                print "\tif [ -z \"$(ls -A \"$dir\" 2>/dev/null || true)\" ]; then"
+                print "\t\treturn 0"
+                print "\tfi"
+                print ""
+                print "\tcat >&2 <<-EOF"
+                print "Target directory is not empty: $dir"
+                print ""
+                print "This looks like a previous install or existing files."
+                print "Re-installing can leave a broken mixed filesystem."
+                print ""
+                print "Do you want to REMOVE ALL files under:"
+                print "  $dir"
+                print "and continue? Type '\''yes'\'' to continue:"
+                print "EOF"
+                print ""
+                print "\tread -r answer"
+                print "\tif [ \"$answer\" != \"yes\" ]; then"
+                print "\t\tdie \"Aborted. Directory not emptied: $dir\""
+                print "\tfi"
+                print ""
+                print "\teinfo \"Removing existing files under $dir\""
+                print "\t[ \"$dir\" != \"/\" ] || die \"Refusing to wipe /\""
+                print "\trm -rf --one-file-system \"$dir\"/* \"$dir\"/.[!.]* \"$dir\"/..?* 2>/dev/null || true"
+                print "}"
+              }
+            ' "$file" > "$file.tmp"
+            mv "$file.tmp" "$file"
+            chmod +x "$file"
           fi
 
-          git add -A
-          git commit -m "Apply patches"
+          # 2) Replace the old “dir not empty” abort block with confirm_wipe_chroot_dir call
+          # If the old block is present, remove it and insert call.
+          if grep -q "Target .*doesn't look empty" "$file"; then
+            perl -0777 -i -pe 's/\n# Be defensive: avoid extracting on top of random existing stuff\.\nif \[ -e "\$CHROOT_DIR\/etc" \] \|\| \[ -e "\$CHROOT_DIR\/usr" \]; then\n\tdie "Target \$CHROOT_DIR doesn.t look empty\. Pick a new -d dir or remove the old one\."\nfi\n/\nconfirm_wipe_chroot_dir "\$CHROOT_DIR"\n/s' "$file"
+          fi
+
+          # Ensure file ends with newline
+          tail -c 1 "$file" | read -r _ || echo >> "$file"
+
+      - name: Commit & push if changed
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git add adelie-chroot-install
+          git commit -m "Prompt before wiping existing chroot dir"
           git push
