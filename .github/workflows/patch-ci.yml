@@ -1,0 +1,44 @@
+name: Apply patch
+
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "*.patch"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-patch
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply patch
+        run: |
+          test -f *.patch
+          git apply --whitespace=fix adelie-chroot-install.patch
+
+      - name: Commit & push (if changes)
+        run: |
+          if git diff --quiet; then
+            echo "No changes after applying patch."
+            exit 0
+          fi
+
+          git add -A
+          git commit -m "Apply patches"
+          git push
