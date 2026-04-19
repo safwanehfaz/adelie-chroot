@@ -1,10 +1,12 @@
-name: Apply patch
+name: Apply patch [Debug]
+
 
 on:
   workflow_dispatch: {}
   push:
     paths:
       - "*.patch"
+    branches: [ debug ]
 
 permissions:
   contents: write
@@ -26,11 +28,20 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
+      
       - name: Apply patch
         run: |
-          test -f *.patch
-          git apply --whitespace=fix *.patch
+          ls -la
+          test -f adelie-chroot-install.patch
+
+          echo "---- Patch header ----"
+          sed -n '1,120p' adelie-chroot-install.patch
+
+          echo "---- Around line 63 ----"
+          nl -ba adelie-chroot-install.patch | sed -n '50,80p'
+
+          git apply --check adelie-chroot-install.patch
+          git apply --whitespace=fix adelie-chroot-install.patch
 
       - name: Commit & push (if changes)
         run: |
