@@ -1,0 +1,52 @@
+diff --git a/adelie-chroot-install b/adelie-chroot-install
+index 0a0a0a0..0b0b0b0 100755
+--- a/adelie-chroot-install
++++ b/adelie-chroot-install
+@@ -1,5 +1,5 @@
+ #!/bin/sh
+-# vim: set ts=4:
++# vim: set ts=4 :
+ #---help---
+ # Usage: adelie-chroot-install [options]
+ #
+@@ -118,7 +118,7 @@ gen_chroot_script() {
+ 	cat <<-'EOF'
+ 
+ 		user='root'
+-		if [ $# -ge 2 ] && [ "$1" = '-u' ]; then
++		if [ $# -ge 2 ] && [ "$1" = '-u' ]; then
+ 		    user="$2"; shift 2
+ 		fi
+ 		oldpwd="$(pwd)"
+@@ -132,12 +132,33 @@ gen_chroot_script() {
+ 
+ 		cd "$(dirname "$0")"
+ 		$_sudo mv "$tmpfile" env.sh
+-		$_sudo chroot . /usr/bin/env -i su -l "$user" \
+-		    sh -c ". /etc/profile 2>/dev/null || true; . /env.sh; cd '$oldpwd' 2>/dev/null; \"\$@\"" \
+-		    -- "${@:-sh}"
++
++		# Adélie rootfs may not have a usable root password / PAM setup for su(1),
++		# so prefer entering without su. If the host chroot(8) supports --userspec,
++		# we can still honor -u USER.
++		if chroot --help 2>/dev/null | grep -q -- '--userspec'; then
++		    userspec="$user"
++		    # If user isn't root, try user:group=user as a reasonable default.
++		    if [ "$user" != root ]; then
++		        userspec="$user:$user"
++		    fi
++		    $_sudo chroot --userspec="$userspec" . /usr/bin/env -i \
++		        sh -lc ". /etc/profile 2>/dev/null || true; . /env.sh; cd '$oldpwd' 2>/dev/null; exec \"\$@\"" \
++		        -- "${@:-sh}"
++		else
++		    if [ "$user" != root ]; then
++		        echo "WARNING: host chroot(8) does not support --userspec; entering as root" >&2
++		    fi
++		    $_sudo chroot . /usr/bin/env -i \
++		        sh -lc ". /etc/profile 2>/dev/null || true; . /env.sh; cd '$oldpwd' 2>/dev/null; exec \"\$@\"" \
++		        -- "${@:-sh}"
++		fi
+ 	EOF
+ 	# NOTE: ash does not load login profile when run with QEMU user-mode
+ 	# emulation (I have no clue why), that's why /etc/profile is sourced here.
+ }
