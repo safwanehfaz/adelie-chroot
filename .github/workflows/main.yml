@@ -1,0 +1,84 @@
+name: Apply root patches
+
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "*.patch"
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Show root patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la
+          shopt -s nullglob
+          patches=( *.patch )
+          if (( ${#patches[@]} == 0 )); then
+            echo "No *.patch files in repo root; nothing to do."
+            exit 0
+          fi
+          printf "Found patches:\n"
+          printf " - %s\n" "${patches[@]}"
+
+      - name: Validate patches (with diagnostics)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for p in *.patch; do
+            echo "==== Validating $p ===="
+            echo "-- file info --"
+            file "$p" || true
+
+            echo "-- first 30 lines --"
+            sed -n '1,30p' "$p" || true
+
+            echo "-- around lines 50-80 (numbered) --"
+            nl -ba "$p" | sed -n '50,80p' || true
+
+            echo "-- ensure newline at EOF (best effort) --"
+            # If last byte isn't newline, append one
+            if [ -n "$(tail -c 1 "$p" | tr -d '\n')" ]; then
+              printf '\n' >> "$p"
+            fi
+
+            echo "-- git apply --check --"
+            git apply --check "$p"
+          done
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for p in *.patch; do
+            echo "Applying $p"
+            git apply --whitespace=fix "$p"
+          done
+
+      - name: Commit & push (if changes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            echo "No changes after applying patches."
+            exit 0
+          fi
+          git add -A
+          git commit -m "Apply root patches"
+          git push
