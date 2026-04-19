@@ -1,10 +1,12 @@
 name: Apply patch
 
+
 on:
   workflow_dispatch: {}
   push:
     paths:
       - "*.patch"
+    branches: [ debug ]
 
 permissions:
   contents: write
