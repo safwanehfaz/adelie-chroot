@@ -30,7 +30,7 @@ jobs:
       - name: Apply patch
         run: |
           test -f *.patch
-          git apply --whitespace=fix adelie-chroot-install.patch
+          git apply --whitespace=fix *.patch
 
       - name: Commit & push (if changes)
         run: |
