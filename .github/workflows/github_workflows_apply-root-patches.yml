@@ -1,59 +1,77 @@
-name: Apply root patches
+name: Fix enter-chroot (no su) for Adélie
 
 on:
   workflow_dispatch: {}
-  push:
-    paths:
-      - "*.patch"
 
 permissions:
   contents: write
-
-concurrency:
-  group: apply-root-patches
-  cancel-in-progress: false
 
 jobs:
   apply:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v4
 
       - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: List patches
-        run: |
-          ls -la
-          echo "Patches found:"
-          ls -1 *.patch
-
-      - name: Apply patches
+      - name: Patch gen_chroot_script to avoid su(1)
         shell: bash
         run: |
           set -euo pipefail
+          f="adelie-chroot-install"
 
-          for p in *.patch; do
-            echo "---- Checking $p ----"
-            # Ensure file ends with newline (avoids some 'corrupt patch' cases)
-            tail -c 1 "$p" | read -r _ || echo >> "$p"
+          # Sanity
+          test -f "$f"
 
-            git apply --check "$p"
-            git apply --whitespace=fix "$p"
-          done
-
-      - name: Commit & push (if changes)
-        run: |
-          if git diff --quiet; then
-            echo "No changes after applying patches."
+          # If already patched, exit cleanly
+          if grep -q "Adélie rootfs may not have a usable root password" "$f"; then
+            echo "Already patched."
             exit 0
           fi
 
-          git add -A
-          git commit -m "Apply root patches"
+          # Replace the su-based chroot invocation block with a userspec-aware sh-based block.
+          perl -0777 -i -pe 's{
+            \Q$_sudo mv "$tmpfile" env.sh\E\s*
+            \Q$_sudo chroot . /usr/bin/env -i su -l "$user" \\\E\s*
+            \Q    sh -c ". /etc/profile 2>/dev/null || true; . /env.sh; cd '\''$oldpwd'\'' 2>/dev/null; \"\$@\"" \\\E\s*
+            \Q    -- "${@:-sh}"\E
+          }{
+            $_sudo mv "$tmpfile" env.sh
+
+\t\t# Adélie rootfs may not have a usable root password / PAM setup for su(1),
+\t\t# so prefer entering without su. If the host chroot(8) supports --userspec,
+\t\t# we can still honor -u USER.
+\t\tif chroot --help 2>/dev/null | grep -q -- \"--userspec\"; then
+\t\t    userspec=\"$user\"
+\t\t    # If user isn'\''t root, try user:group=user as a reasonable default.
+\t\t    if [ \"$user\" != root ]; then
+\t\t        userspec=\"$user:$user\"
+\t\t    fi
+\t\t    $_sudo chroot --userspec=\"$userspec\" . /usr/bin/env -i \\
+\t\t        sh -lc \". /etc/profile 2>/dev/null || true; . /env.sh; cd '\''$oldpwd'\'' 2>/dev/null; exec \\\\\\\"\\\\$@\\\\\\\"\" \\
+\t\t        -- \"${@:-sh}\"
+\t\telse
+\t\t    if [ \"$user\" != root ]; then
+\t\t        echo \"WARNING: host chroot(8) does not support --userspec; entering as root\" >&2
+\t\t    fi
+\t\t    $_sudo chroot . /usr/bin/env -i \\
+\t\t        sh -lc \". /etc/profile 2>/dev/null || true; . /env.sh; cd '\''$oldpwd'\'' 2>/dev/null; exec \\\\\\\"\\\\$@\\\\\\\"\" \\
+\t\t        -- \"${@:-sh}\"
+\t\tfi
+          }xs' "$f"
+
+          # Make sure it actually changed
+          grep -q "Adélie rootfs may not have a usable root password" "$f"
+
+      - name: Commit & push if changed
+        run: |
+          if git diff --quiet; then
+            echo "No changes."
+            exit 0
+          fi
+          git add adelie-chroot-install
+          git commit -m "enter-chroot: avoid su; use chroot --userspec when available"
           git push
