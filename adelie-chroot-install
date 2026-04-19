@@ -1,0 +1,280 @@
+#!/bin/sh
+# vim: set ts=4:
+#---help---
+# Usage: adelie-chroot-install [options]
+#
+# This script installs Adélie Linux into a chroot from a prebuilt rootfs tarball,
+# and creates an "enter-chroot" helper inside the chroot directory.
+#
+# Example:
+#   sudo ./adelie-chroot-install -d /adelie
+#   /adelie/enter-chroot
+#
+# Options and environment variables:
+#   -a ARCH                CPU architecture for the chroot. Default: host arch.
+#                          If different from host arch, tries to use qemu-user.
+#                          Example: x86_64, aarch64, armhf, riscv64...
+#
+#   -d CHROOT_DIR          Absolute path to where the chroot will be installed
+#                          (default is /adelie).
+#
+#   -i BIND_DIR            Absolute path on host to bind-mount into the chroot
+#                          at the same path (default is PWD if under /home).
+#
+#   -k CHROOT_KEEP_VARS... Env var names/regex to pass into chroot via enter-chroot.
+#                          Default: ARCH CI QEMU_EMULATOR TRAVIS_.*.
+#
+#   -t TEMP_DIR            Temp dir for downloads (defaults to `mktemp -d`).
+#
+#   -h                     Show this help message and exit.
+#
+#   -v                     Print version and exit.
+#
+#   ADELIE_ROOTFS_URI      Rootfs tarball URL to download.
+#                          Default points to Adélie 1.0-beta6 x86_64 rootfs-full.
+#
+#   ADELIE_ROOTFS_SHA256   Optional SHA-256 checksum for the tarball (recommended).
+#
+#---help---
+set -eu
+
+#=======================  C o n s t a n t s  =======================#
+
+VERSION='0.1.0'
+
+: ${ADELIE_ROOTFS_URI:="https://distfiles.adelielinux.org/adelie/1.0-beta6/iso/adelie-rootfs-full-x86_64-1.0-beta6-20241223.txz"}
+: ${ADELIE_ROOTFS_SHA256:=""}  # set this to enable verification
+
+#=======================  F u n c t i o n s  =======================#
+
+die() {
+	printf '\033[1;31mERROR:\033[0m %s\n' "$@" >&2
+	exit 1
+}
+
+einfo() {
+	printf '\n\033[1;36m> %s\033[0m\n' "$@" >&2
+}
+
+fetch_url() {
+	local url="$1"
+	echo "fetch $url" >&2
+
+	if command -v curl >/dev/null 2>&1; then
+		curl --remote-name --connect-timeout 10 -fsSL "$url"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -T 10 --no-verbose "$url"
+	else
+		die 'Cannot download a file: neither curl nor wget is available!'
+	fi
+}
+
+download_file() (
+	local url="$1"
+	local sha256="$2"
+	local dest="${3:-.}"
+
+	mkdir -p "$dest" \
+		&& cd "$dest" \
+		&& rm -f "${url##*/}" \
+		&& fetch_url "$url"
+
+	if [ -n "$sha256" ]; then
+		echo "$sha256  ${url##*/}" | sha256sum -c
+	else
+		echo "WARNING: ADELIE_ROOTFS_SHA256 not set; skipping SHA256 verification" >&2
+	fi
+)
+
+usage() {
+	sed -En '/^#---help---/,/^#---help---/p' "$0" | sed -E 's/^# ?//; 1d;$d;'
+}
+
+normalize_arch() {
+	case "$1" in
+		x86 | i[3456]86) echo 'i386';;
+		armhf | armv[4-9]) echo 'arm';;
+		*) echo "$1";;
+	esac
+}
+
+gen_chroot_script() {
+	cat <<-EOF
+		#!/bin/sh
+		set -e
+
+		ENV_FILTER_REGEX='($(echo "$CHROOT_KEEP_VARS" | tr -s ' ' '|'))'
+	EOF
+	if [ -n "$QEMU_EMULATOR" ]; then
+		printf 'export QEMU_EMULATOR="%s"\n' "$QEMU_EMULATOR"
+	fi
+	cat <<-'EOF'
+
+		user='root'
+		if [ $# -ge 2 ] && [ "$1" = '-u' ]; then
+		    user="$2"; shift 2
+		fi
+		oldpwd="$(pwd)"
+		[ "$(id -u)" -eq 0 ] || _sudo='sudo'
+
+		tmpfile="$(mktemp)"
+		chmod 644 "$tmpfile"
+		export | sed -En "s/^([^=]+ ${ENV_FILTER_REGEX}=)('.*'|\".*\")$/\1\3/p" > "$tmpfile" || true
+
+		cd "$(dirname "$0")"
+		$_sudo mv "$tmpfile" env.sh
+		$_sudo chroot . /usr/bin/env -i su -l "$user" \
+		    sh -c ". /etc/profile 2>/dev/null || true; . /env.sh; cd '$oldpwd' 2>/dev/null; \"\$@\"" \
+		    -- "${@:-sh}"
+	EOF
+}
+
+gen_destroy_script() {
+	cat <<-'EOF'
+		#!/bin/sh
+		set -e
+
+		remove=no
+		case "$1" in
+			-r | --remove) remove=yes;;
+			'') ;;
+			*) echo "Usage: $0 [-r | --remove]"; exit 1;;
+		esac
+
+		SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+		[ "$(id -u)" -eq 0 ] || _sudo='sudo'
+
+		cat /proc/mounts | cut -d' ' -f2 | grep "^$SCRIPT_DIR." | sort -r | while read path; do
+			echo "Unmounting $path" >&2
+			$_sudo umount -fn "$path" || exit 1
+		done
+
+		if [ "$remove" = yes ]; then
+			rm_opts=''
+			rm --help 2>&1 | grep -Fq 'one-file-system' && rm_opts='--one-file-system'
+
+			echo "Removing $SCRIPT_DIR" >&2
+			$_sudo rm -Rf $rm_opts "$SCRIPT_DIR"
+		else
+			echo "If you want to remove $SCRIPT_DIR directory, run: $0 --remove" >&2
+		fi
+	EOF
+}
+
+#------------------------- Debian/Ubuntu ---------------------------#
+
+APT_UPDATED=no
+
+apt_install() {
+	if [ "$APT_UPDATED" != yes ]; then
+		apt-get update
+		APT_UPDATED=yes
+	fi
+	apt-get install -y -o=Dpkg::Use-Pty=0 --no-install-recommends "$@"
+}
+
+install_binfmt_support() {
+	apt_install binfmt-support \
+		|| die 'Failed to install binfmt-support using apt-get!'
+	update-binfmts --enable \
+		|| die 'Failed to enable binfmt!'
+}
+
+install_qemu_user() {
+	apt_install qemu-user-static \
+		|| die 'Failed to install qemu-user-static using apt-get!'
+}
+
+#============================  M a i n  ============================#
+
+while getopts 'a:d:i:k:t:hv' OPTION; do
+	case "$OPTION" in
+		a) ARCH="$OPTARG";;
+		d) CHROOT_DIR="$OPTARG";;
+		i) BIND_DIR="$OPTARG";;
+		k) CHROOT_KEEP_VARS="${CHROOT_KEEP_VARS:-} $OPTARG";;
+		t) TEMP_DIR="$OPTARG";;
+		h) usage; exit 0;;
+		v) echo "adelie-chroot-install $VERSION"; exit 0;;
+	esac
+done
+
+: ${ARCH:=}
+: ${BIND_DIR:=}
+: ${CHROOT_DIR:="/adelie"}
+: ${CHROOT_KEEP_VARS:="ARCH CI QEMU_EMULATOR TRAVIS_.*"}
+: ${TEMP_DIR:=$(mktemp -d || echo /tmp/adelie)}
+
+[ "$BIND_DIR" ] || case "$(pwd)" in
+	/home/*) BIND_DIR="$(pwd)";;
+esac
+
+if [ "$(id -u)" -ne 0 ]; then
+	die 'This script must be run as root!'
+fi
+
+mkdir -p "$CHROOT_DIR"
+cd "$CHROOT_DIR"
+
+# Optional QEMU user-mode emulation if cross-arch
+QEMU_EMULATOR=''
+if [ -n "$ARCH" ] && [ "$(normalize_arch "$ARCH")" != "$(normalize_arch "$(uname -m)")" ]; then
+	qemu_arch="$(normalize_arch "$ARCH")"
+	QEMU_EMULATOR="/usr/bin/qemu-$qemu_arch-static"
+
+	if [ ! -x "$QEMU_EMULATOR" ]; then
+		einfo 'Installing qemu-user-static on host system...'
+		install_qemu_user
+	fi
+
+	if [ ! -e "/proc/sys/fs/binfmt_misc/qemu-$qemu_arch" ]; then
+		einfo 'Installing and enabling binfmt-support on host system...'
+		install_binfmt_support
+	fi
+
+	mkdir -p usr/bin
+	cp -v "$QEMU_EMULATOR" usr/bin/
+fi
+
+einfo 'Downloading Adélie rootfs tarball'
+download_file "$ADELIE_ROOTFS_URI" "$ADELIE_ROOTFS_SHA256" "$TEMP_DIR"
+ROOTFS="$TEMP_DIR/${ADELIE_ROOTFS_URI##*/}"
+
+einfo "Extracting Adélie rootfs into $CHROOT_DIR"
+# Be defensive: avoid extracting on top of random existing stuff.
+if [ -e "$CHROOT_DIR/etc" ] || [ -e "$CHROOT_DIR/usr" ]; then
+	die "Target $CHROOT_DIR doesn't look empty. Pick a new -d dir or remove the old one."
+fi
+tar -xJf "$ROOTFS" -C "$CHROOT_DIR"
+
+gen_chroot_script > "$CHROOT_DIR/enter-chroot"
+gen_destroy_script > "$CHROOT_DIR/destroy"
+chmod +x "$CHROOT_DIR/enter-chroot" "$CHROOT_DIR/destroy"
+
+einfo 'Binding filesystems into chroot'
+cd "$CHROOT_DIR"
+
+mount -v -t proc none proc
+mount -v --rbind /sys sys
+mount --make-rprivate sys
+mount -v --rbind /dev dev
+mount --make-rprivate dev
+
+if [ -L /dev/shm ] && [ -d /run/shm ]; then
+	mkdir -p run/shm
+	mount -v --bind /run/shm run/shm
+	mount --make-private run/shm
+fi
+
+if [ -d "$BIND_DIR" ]; then
+	mkdir -p "${CHROOT_DIR}${BIND_DIR}"
+	mount -v --bind "$BIND_DIR" "${CHROOT_DIR}${BIND_DIR}"
+	mount --make-private "${CHROOT_DIR}${BIND_DIR}"
+fi
+
+cat >&2 <<-EOF
+	---
+	Adélie installation is complete
+	Run $CHROOT_DIR/enter-chroot [-u <user>] [command] to enter the chroot
+	and $CHROOT_DIR/destroy [--remove] to destroy it.
+EOF
