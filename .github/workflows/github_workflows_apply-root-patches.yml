@@ -1,0 +1,59 @@
+name: Apply root patches
+
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "*.patch"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-root-patches
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: List patches
+        run: |
+          ls -la
+          echo "Patches found:"
+          ls -1 *.patch
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for p in *.patch; do
+            echo "---- Checking $p ----"
+            # Ensure file ends with newline (avoids some 'corrupt patch' cases)
+            tail -c 1 "$p" | read -r _ || echo >> "$p"
+
+            git apply --check "$p"
+            git apply --whitespace=fix "$p"
+          done
+
+      - name: Commit & push (if changes)
+        run: |
+          if git diff --quiet; then
+            echo "No changes after applying patches."
+            exit 0
+          fi
+
+          git add -A
+          git commit -m "Apply root patches"
+          git push
